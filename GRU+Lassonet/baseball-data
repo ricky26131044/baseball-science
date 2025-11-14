@@ -1,0 +1,507 @@
+# -*- coding: utf-8 -*-
+# GRU + Skip(L1) + Hierarchical Constraint (LassoNet-style)
+# 一鍵切換：with_l1 / no_l1 / both，並評估 x_t -> y_{t+1}（含 2025 外推）
+
+import os
+import json
+import argparse
+from typing import List, Tuple, Dict
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+
+# -------------------------
+# Dataset / Utils
+# -------------------------
+ID_COL_CANDIDATES = ["n", "player_id", "PlayerID", "PlayerNameRoute"]
+
+def to_numeric_force(s):
+    return pd.to_numeric(s, errors="coerce")
+
+def detect_id_col(df: pd.DataFrame) -> str:
+    for c in ID_COL_CANDIDATES:
+        if c in df.columns:
+            return c
+    for c in ["PlayerNameRoute", "player", "name", "Player"]:
+        if c in df.columns:
+            return c
+    raise ValueError("找不到 ID 欄位（例如 n / player_id / PlayerNameRoute）")
+
+def one_hot_non_numeric(df: pd.DataFrame, drop_cols: List[str]) -> pd.DataFrame:
+    obj_cols = [c for c in df.columns
+                if (df[c].dtype == "object" or str(df[c].dtype).startswith("category")) and c not in drop_cols]
+    if not obj_cols:
+        return df
+    return pd.get_dummies(df, columns=obj_cols, dummy_na=False)
+
+def auto_feature_cols(df: pd.DataFrame, id_col: str, target_col: str, season_col: str) -> List[str]:
+    exclude = set([target_col, id_col, season_col, "cluster", "cluster_person", "PlayerNameRoute", "_target"])
+    feats = [c for c in df.columns if c not in exclude]
+    return feats
+
+def split_ids(ids: np.ndarray, test_size=0.15, val_size=0.15, random_state=42):
+    ids = np.array(ids)
+    uniq = np.unique(ids)
+    train_ids, hold_ids = train_test_split(uniq, test_size=test_size+val_size, random_state=random_state, shuffle=True)
+    rel = test_size / (test_size + val_size)
+    val_ids, test_ids = train_test_split(hold_ids, test_size=rel, random_state=random_state, shuffle=True)
+    return set(train_ids), set(val_ids), set(test_ids)
+
+class SeqDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, ids_set: set, id_col: str, season_col: str, x_cols: List[str], y_col: str):
+        self.samples: List[Tuple[torch.Tensor, torch.Tensor, int]] = []
+        for pid, g in df[df[id_col].isin(ids_set)].groupby(id_col):
+            g = g.sort_values(season_col)
+            x = torch.tensor(g[x_cols].values, dtype=torch.float32)
+            y = torch.tensor(g[y_col].values, dtype=torch.float32).view(-1, 1)
+            if len(x) == 0:
+                continue
+            self.samples.append((x, y, len(x)))
+        if not self.samples:
+            raise ValueError("該 split 沒有樣本，請檢查分割或 ID 欄")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]  # (x_seq[T,F], y_seq[T,1], T)
+
+def collate_batch(batch):
+    xs, ys, lens = zip(*batch)
+    lens = torch.tensor(lens, dtype=torch.long)
+    x_pad = pad_sequence(xs, batch_first=True)  # [B, Tmax, F]
+    y_pad = pad_sequence(ys, batch_first=True)  # [B, Tmax, 1]
+    return x_pad, y_pad, lens
+
+# -------------------------
+# Model
+# -------------------------
+class GRUWithHierLasso(nn.Module):
+    """
+    y_t = head(GRU(x_t)) + skip(x_t)
+    階層式約束（LassoNet 風格）：
+        ||W_ih[:, j]||_∞ <= M * |beta_j|, 其中 beta_j = skip.weight[0, j]
+    透過每步 optimizer.step() 後的投影（prox）維持可行解。
+    """
+    def __init__(self, input_dim, hidden_dim, num_layers=1, bidirectional=False, dropout=0.1):
+        super().__init__()
+        self.gru = nn.GRU(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional,
+        )
+        out_dim = hidden_dim * (2 if bidirectional else 1)
+        self.head = nn.Linear(out_dim, 1)
+        self.skip = nn.Linear(input_dim, 1, bias=False)
+
+    def forward(self, x_pad, lens):
+        packed = pack_padded_sequence(x_pad, lengths=lens.cpu(), batch_first=True, enforce_sorted=False)
+        h, _ = self.gru(packed)
+        h_pad, _ = pad_packed_sequence(h, batch_first=True)  # [B, T, H*dir]
+        y_gru = self.head(h_pad)                             # [B, T, 1]
+        y_skip = self.skip(x_pad)                            # [B, T, 1]
+        return y_gru + y_skip
+
+    @torch.no_grad()
+    def prox_hierarchy(self, M=1.0):
+        eps = 1e-12
+        beta = self.skip.weight.view(-1)        # [F]
+        bound = M * beta.abs()                  # [F]
+
+        def project_weight_matrix(W):
+            theta_inf = torch.amax(W.abs(), dim=0)                 # [F]
+            scale = torch.clamp(bound / (theta_inf + eps), max=1.) # [F]
+            W *= scale.unsqueeze(0)
+
+        project_weight_matrix(self.gru.weight_ih_l0)
+        if hasattr(self.gru, "weight_ih_l0_reverse"):
+            project_weight_matrix(self.gru.weight_ih_l0_reverse)
+
+# -------------------------
+# Loss / Eval: x_t -> y_{t+1}
+# -------------------------
+def masked_mse_next(yhat, y, lens):
+    """
+    用 x_t 的輸出 yhat[:, t] 對齊下一季的真值 y[:, t+1]
+    """
+    if yhat.size(1) <= 1:
+        return yhat.new_tensor(0.0)
+    valid_len = (lens - 1).clamp(min=0)
+    Tm1 = yhat.size(1) - 1
+    mask = (torch.arange(Tm1, device=yhat.device).unsqueeze(0) < valid_len.unsqueeze(1))
+    diff = (yhat[:, :-1, 0] - y[:, 1:, 0]) ** 2
+    diff = diff * mask
+    denom = mask.sum().clamp(min=1)
+    return diff.sum() / denom
+
+def evaluate_next(model, loader):
+    model.eval()
+    total_sq, total_abs, total_n = 0.0, 0.0, 0
+    with torch.no_grad():
+        for x, y, lens in loader:
+            x, y, lens = x.to(model.skip.weight.device), y.to(model.skip.weight.device), lens.to(model.skip.weight.device)
+            yhat = model(x, lens)
+            if yhat.size(1) <= 1:
+                continue
+            valid_len = (lens - 1).clamp(min=0)
+            Tm1 = yhat.size(1) - 1
+            mask = (torch.arange(Tm1, device=yhat.device).unsqueeze(0) < valid_len.unsqueeze(1))
+            err = (yhat[:, :-1, 0] - y[:, 1:, 0])
+            total_sq  += (err.pow(2) * mask).sum().item()
+            total_abs += (err.abs()   * mask).sum().item()
+            total_n   += mask.sum().item()
+    mse = total_sq / max(1, total_n)
+    mae = total_abs / max(1, total_n)
+    return mse, mae
+
+# -------------------------
+# Train 1 experiment
+# -------------------------
+def run_experiment(
+    data_path: str,
+    season_col: str,
+    target_col: str,
+    year_to_pred: int,
+    random_state: int,
+    hidden_dim: int,
+    num_layers: int,
+    bidirectional: bool,
+    dropout: float,
+    lambda_l1: float,
+    hier_m: float,
+    batch_size: int,
+    epochs: int,
+    lr: float,
+    clip_grad: float,
+    use_log_target: bool,
+    out_dir: str,
+) -> Dict[str, float]:
+
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    np.random.seed(random_state)
+    torch.manual_seed(random_state)
+
+    raw = pd.read_csv(data_path)
+    id_col = detect_id_col(raw)
+
+    # 數值化 / 去 NA
+    raw[target_col] = to_numeric_force(raw[target_col])
+    raw = raw.dropna(subset=[target_col, season_col, id_col]).copy()
+
+    # one-hot（避開 id/season/target）
+    raw = one_hot_non_numeric(raw, drop_cols=[id_col, season_col, target_col])
+
+    # 特徵欄
+    feature_cols = auto_feature_cols(raw, id_col, target_col, season_col)
+
+    # 1) 先把特徵都轉成數值（無法轉的變 NaN）
+    for c in feature_cols:
+        raw[c] = pd.to_numeric(raw[c], errors="coerce")
+
+    # 2) 用“同一球員”的生涯平均補各特徵的缺失
+    player_means = raw.groupby(id_col)[feature_cols].transform("mean")
+    raw[feature_cols] = raw[feature_cols].fillna(player_means)
+
+    # 3) 若某球員某特徵整列都缺（生涯平均也會是 NaN），再用全體平均收尾
+    global_means = raw[feature_cols].mean()
+    raw[feature_cols] = raw[feature_cols].fillna(global_means)
+
+
+    # 排序 + 目標轉換
+    raw = raw.sort_values([id_col, season_col]).reset_index(drop=True)
+    if use_log_target:
+        raw["_target"] = np.log1p(raw[target_col].astype(float))
+    else:
+        raw["_target"] = raw[target_col].astype(float)
+
+    # 標準化（簡化：在全資料上 fit；要嚴格可改只在 train fit）
+    scaler = StandardScaler()
+    raw[feature_cols] = scaler.fit_transform(raw[feature_cols].astype(float))
+
+    # split & dataloader
+    train_ids, val_ids, test_ids = split_ids(raw[id_col].values, test_size=0.15, val_size=0.15, random_state=random_state)
+    ds_train = SeqDataset(raw, train_ids, id_col, season_col, feature_cols, "_target")
+    ds_val   = SeqDataset(raw, val_ids,   id_col, season_col, feature_cols, "_target")
+    ds_test  = SeqDataset(raw, test_ids,  id_col, season_col, feature_cols, "_target")
+
+    dl_train = DataLoader(ds_train, batch_size=batch_size, shuffle=True,  collate_fn=collate_batch)
+    dl_val   = DataLoader(ds_val,   batch_size=batch_size, shuffle=False, collate_fn=collate_batch)
+    dl_test  = DataLoader(ds_test,  batch_size=batch_size, shuffle=False, collate_fn=collate_batch)
+
+    input_dim = len(feature_cols)
+
+    # model
+    model = GRUWithHierLasso(
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        bidirectional=bidirectional,
+        dropout=dropout,
+    ).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    os.makedirs(out_dir, exist_ok=True)
+    best_val = float("inf")
+    patience = 20
+    wait = 0
+    history = []
+
+    # train
+    for epoch in range(1, epochs + 1):
+        model.train()
+        for x, y, lens in dl_train:
+            x, y, lens = x.to(DEVICE), y.to(DEVICE), lens.to(DEVICE)
+            yhat = model(x, lens)
+            loss_fit = masked_mse_next(yhat, y, lens)
+            l1_skip  = model.skip.weight.abs().sum()
+            loss = loss_fit + lambda_l1 * l1_skip
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad)
+            optimizer.step()
+
+            # 階層投影
+            model.prox_hierarchy(M=hier_m)
+
+        tr_mse, tr_mae = evaluate_next(model, dl_train)
+        va_mse, va_mae = evaluate_next(model, dl_val)
+        history.append({"epoch": epoch, "train_mse": tr_mse, "val_mse": va_mse})
+        print(f"[{out_dir}] Epoch {epoch:03d} | train MSE {tr_mse:.4f} | val MSE {va_mse:.4f} | L1(skip) {l1_skip.item():.3f}")
+
+        if va_mse + 1e-9 < best_val:
+            best_val = va_mse
+            wait = 0
+            torch.save(model.state_dict(), os.path.join(out_dir, "best.pt"))
+        else:
+            wait += 1
+            if wait >= patience:
+                print("Early stopping.")
+                break
+
+    # load best & test
+    model.load_state_dict(torch.load(os.path.join(out_dir, "best.pt"), map_location=DEVICE))
+    test_mse, test_mae = evaluate_next(model, dl_test)
+    print(f"[{out_dir}][TEST next-year] MSE={test_mse:.4f}  MAE={test_mae:.4f}")
+
+    # 2025 外推（用 ≤ 2024 的特徵，預測 2025）
+    df_all = raw[[id_col, season_col, "_target"] + feature_cols].copy().sort_values([id_col, season_col])
+    model.eval()
+    pred_rows = []
+    with torch.no_grad():
+        for pid, g in df_all.groupby(id_col):
+            g = g.sort_values(season_col)
+            hist = g[g[season_col] <= (year_to_pred - 1)]
+            if len(hist) == 0:
+                continue
+            x_seq = torch.tensor(hist[feature_cols].values, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+            lens  = torch.tensor([len(hist)], dtype=torch.long, device=DEVICE)
+            yhat  = model(x_seq, lens)        # [1,T,1]
+            if yhat.size(1) == 0:
+                continue
+            pred_next = yhat[0, -1, 0].item()
+            if use_log_target:
+                pred_next = float(np.expm1(pred_next))
+
+            true_next = np.nan
+            g_next = g[g[season_col] == year_to_pred]
+            if len(g_next) > 0:
+                true_next = g_next["_target"].iloc[-1]
+                if np.isfinite(true_next):
+                    true_next = float(np.expm1(true_next)) if use_log_target else float(true_next)
+                else:
+                    true_next = np.nan
+
+            pred_rows.append({id_col: pid, "Season": year_to_pred, "pred_salary": pred_next, "true_salary": true_next})
+
+    pred_df = pd.DataFrame(pred_rows).sort_values(id_col).reset_index(drop=True)
+    pred_path = os.path.join(out_dir, f"pred_{year_to_pred}_from_{year_to_pred-1}.csv")
+    pred_df.to_csv(pred_path, index=False)
+    print(f"[{out_dir}] Saved {year_to_pred} predictions -> {pred_path}")
+
+    rmse_2025 = mae_2025 = np.nan
+    if pred_df["true_salary"].notna().any():
+        df_eval = pred_df.dropna(subset=["true_salary"]).copy()
+        rmse_2025 = float(np.sqrt(np.mean((df_eval["pred_salary"] - df_eval["true_salary"])**2)))
+        mae_2025  = float(np.mean(np.abs(df_eval["pred_salary"] - df_eval["true_salary"])))
+        print(f"[{out_dir}][{year_to_pred}] RMSE={rmse_2025:.4f}  MAE={mae_2025:.4f}  (n={len(df_eval)})")
+    else:
+        print(f"[{out_dir}][{year_to_pred}] 沒有真實薪資可評估（僅輸出預測）。")
+
+    # Feature importance by skip
+    with torch.no_grad():
+        beta = model.skip.weight.view(-1).detach().cpu().numpy()
+    feat_imp = pd.DataFrame({"feature": feature_cols, "beta": beta, "importance": np.abs(beta)}).sort_values(
+        "importance", ascending=False).reset_index(drop=True)
+    feat_imp.to_csv(os.path.join(out_dir, "feature_importance_skip.csv"), index=False)
+
+    topk = min(100, len(feat_imp))
+    plt.figure(figsize=(10, 6))
+    plt.bar(np.arange(topk), feat_imp["importance"].values[:topk])
+    plt.xticks(np.arange(topk), feat_imp["feature"].values[:topk], rotation=45, ha="right")
+    plt.ylabel("Relative importance (normalized skip weight)")
+    plt.title("MLB Hitter Salary Prediction — Feature Importance (GRU + LassoNet)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "feature_importance_skip.png"), dpi=150)
+    plt.close()
+
+    # summary
+    summary = {
+        "config": {
+            "DATA_PATH": data_path,
+            "USE_LOG_TARGET": use_log_target,
+            "HIDDEN_DIM": hidden_dim,
+            "NUM_LAYERS": num_layers,
+            "BIDIRECTIONAL": bidirectional,
+            "DROPOUT": dropout,
+            "LAMBDA_L1": lambda_l1,
+            "HIER_M": hier_m,
+            "LR": lr,
+            "BATCH_SIZE": batch_size,
+            "EPOCHS": epochs,
+            "RANDOM_STATE": random_state,
+        },
+        "test_mse_next": test_mse,
+        "test_mae_next": test_mae,
+        f"{year_to_pred}_rmse": rmse_2025,
+        f"{year_to_pred}_mae": mae_2025,
+    }
+    with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    return {
+        "out_dir": out_dir,
+        "test_mse": test_mse,
+        "test_mae": test_mae,
+        "rmse_next_year": rmse_2025,
+        "mae_next_year": mae_2025,
+    }
+
+# -------------------------
+# CLI
+# -------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="GRU + L1(skip) + Hierarchical constraint with one-click switch")
+    p.add_argument("--data-path", type=str, required=True, help="CSV 檔路徑")
+    p.add_argument("--season-col", type=str, default="Season")
+    p.add_argument("--target-col", type=str, default="Salary")
+    p.add_argument("--year-to-pred", type=int, default=2025)
+
+    p.add_argument("--mode", type=str, choices=["with_l1", "no_l1", "both"], default="both",
+                   help="with_l1: 啟用 L1；no_l1: 關閉 L1；both: 兩種都跑")
+
+    p.add_argument("--lambda-l1", type=float, default=1e-3, help="with_l1 模式的 L1 強度（no_l1 會自動覆蓋為 0）")
+    p.add_argument("--hier-m", type=float, default=10.0, help="階層式約束 M")
+
+    p.add_argument("--hidden-dim", type=int, default=64)
+    p.add_argument("--num-layers", type=int, default=2)
+    p.add_argument("--bidirectional", action="store_true")
+    p.add_argument("--dropout", type=float, default=0.1)
+
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--epochs", type=int, default=150)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--clip-grad", type=float, default=1.0)
+    p.add_argument("--use-log-target", action="store_true")
+
+    p.add_argument("--random-state", type=int, default=42)
+    p.add_argument("--out-root", type=str, default="./gru_switch_runs")
+    return p.parse_args()
+def main(args=None):
+    if args is None:
+        args = parse_args()
+    # 原本 main 的內容保持不變，全部改成用 args.xxx
+
+        os.makedirs(args.out_root, exist_ok=True)
+
+    runs = []
+    if args.mode in ("with_l1", "both"):
+        out_dir = os.path.join(args.out_root, f"with_l1_l{args.lambda_l1}".replace(".", "p"))
+        res = run_experiment(
+            data_path=args.data_path,
+            season_col=args.season_col,
+            target_col=args.target_col,
+            year_to_pred=args.year_to_pred,
+            random_state=args.random_state,
+            hidden_dim=args.hidden_dim,
+            num_layers=args.num_layers,
+            bidirectional=args.bidirectional,
+            dropout=args.dropout,
+            lambda_l1=args.lambda_l1,
+            hier_m=args.hier_m,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            lr=args.lr,
+            clip_grad=args.clip_grad,
+            use_log_target=args.use_log_target,
+            out_dir=out_dir,
+        )
+        runs.append({"mode": "with_l1", **res})
+
+    if args.mode in ("no_l1", "both"):
+        out_dir = os.path.join(args.out_root, "no_l1")
+        res = run_experiment(
+            data_path=args.data_path,
+            season_col=args.season_col,
+            target_col=args.target_col,
+            year_to_pred=args.year_to_pred,
+            random_state=args.random_state,
+            hidden_dim=args.hidden_dim,
+            num_layers=args.num_layers,
+            bidirectional=args.bidirectional,
+            dropout=args.dropout,
+            lambda_l1=0.0,           # 關閉 L1
+            hier_m=args.hier_m,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            lr=args.lr,
+            clip_grad=args.clip_grad,
+            use_log_target=args.use_log_target,
+            out_dir=out_dir,
+        )
+        runs.append({"mode": "no_l1", **res})
+
+    # 輸出對照表
+    if len(runs) > 1:
+        df = pd.DataFrame(runs)[["mode", "out_dir", "test_mse", "test_mae", "rmse_next_year", "mae_next_year"]]
+        comp_path = os.path.join(args.out_root, "comparison.csv")
+        df.to_csv(comp_path, index=False)
+        print("\n=== Comparison ===")
+        print(df.to_string(index=False))
+        print(f"\nSaved comparison -> {comp_path}")
+
+if __name__ == "__main__":
+    main()
+
+import argparse
+args = argparse.Namespace(
+    data_path=r"C:\Users\r2613\Downloads\MLB_nostandard - 複製 (2) - 複製.csv",
+    season_col="Season",
+    target_col="Salary",
+    year_to_pred=2025,
+    mode="both",             # "with_l1" / "no_l1" / "both"
+    lambda_l1=1e-3,
+    hier_m=10.0,
+    hidden_dim= 100,
+    num_layers=2,
+    bidirectional=False,
+    dropout=0.1,
+    batch_size=64,
+    epochs=150,
+    lr=1e-3,
+    clip_grad=1.0,
+    use_log_target=False,
+    random_state= 50,
+    out_root="./gru_switch_runs3"
+)
+main(args)
